@@ -1,0 +1,12 @@
+name = "omi-assistant"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# Session storage. The `id` is filled in automatically once we create the
+# namespace (step 3 of deployment) — leave the placeholder until then.
+[[kv_namespaces]]
+binding = "OMI_SESSIONS"
+id = "6351adbbb91943409c7bf93774ac5b8b"
+
+# Secrets are NOT stored here. They are set with `wrangler secret put`:
+#   ANTHROPIC_API_KEY, OMI_APP_ID, OMI_APP_SECRET
