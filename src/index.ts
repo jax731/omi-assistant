@@ -349,11 +349,13 @@ async function notifyOmi(env: Env, uid: string, message: string): Promise<void> 
       headers: { Authorization: `Bearer ${env.OMI_APP_SECRET}` },
     });
 
-    if (!res.ok) {
-      const errBody = await res.text();
-      console.log(`ERROR omi status=${res.status} body=${truncate(errBody, 300)}`);
+    const respBody = await res.text();
+    if (res.ok) {
+      console.log(
+        `NOTIFIED uid=${uid} status=${res.status} body=${truncate(respBody, 300)} msg="${truncate(message, 120)}"`,
+      );
     } else {
-      console.log(`NOTIFIED uid=${uid} msg="${truncate(message, 120)}"`);
+      console.log(`ERROR omi status=${res.status} body=${truncate(respBody, 300)}`);
     }
   } catch (e) {
     console.log(`ERROR omi exception ${stringifyErr(e)}`);
