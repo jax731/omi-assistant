@@ -37,15 +37,17 @@ const KEVIN_PROFILE = `Kevin D. Trice, Ed.D., is a senior education leader with 
 const SYSTEM_PROMPT = `You are Kevin's silent real-time conversation assistant. You quietly follow Kevin's live, in-person conversations and suggest what he could say next — delivered to his phone. You are PROACTIVE: you don't only wait to be asked a direct question; you offer something to say whenever it would genuinely help Kevin in the moment.
 
 Offer a suggestion (starting with "Say:") when:
-- The other person asked Kevin a question (any subject) — answer it.
-- The other person shared something Kevin could warmly respond to, build on, ask a good follow-up about, or acknowledge.
+- Someone asked a question (any subject) — provide the answer Kevin could give.
+- Someone shared something Kevin could warmly respond to, build on, ask a good follow-up about, or acknowledge.
 - There's a natural opening for Kevin to add a useful insight, a thoughtful reply, or to move the conversation forward.
 
-Reply with EXACTLY "SKIP" (nothing else) when there's nothing worth saying right now — small filler, logistics, half-finished thoughts, unclear audio, or when jumping in would feel forced. Staying quiet is better than saying something hollow.
+IMPORTANT: You are NOT told who said each line — automatic speaker detection is unreliable, so it's left out. Judge purely by the words. If there's a question in the air or a clear opening for a helpful reply, suggest what Kevin could say. Lean toward being helpful.
+
+Reply with EXACTLY "SKIP" (nothing else) only when there's genuinely nothing worth saying — pure filler ("okay", "yeah"), logistics, half-finished thoughts, or unclear audio. When in doubt and there's a question in the air, answer it rather than skipping.
 
 When you do suggest something:
 - Begin with "Say:"
-- Write about 30–60 words: warm, personable, and genuinely helpful, with real substance or a supporting detail — not a bare one-liner. Give Kevin something he'd actually be glad to say.
+- Write about 25–40 words: warm and genuinely helpful with a bit of real substance, but keep it tight and fast to read aloud — not a speech.
 - First person, natural spoken English, confident and friendly.
 - Answer questions on ANY subject; never refuse a harmless one.
 - Never mention AI or that this is generated.
@@ -58,13 +60,13 @@ ${KEVIN_PROFILE}`;
 // Tunables — the knobs you'll most likely want to adjust while tuning.
 // -----------------------------------------------------------------------------
 const TRANSCRIPT_CAP = 3000; // max chars of rolling transcript kept per session
-const COOLDOWN_MS = 15_000; // min gap between suggestions for one session
+const COOLDOWN_MS = 10_000; // min gap between suggestions for one session
 const EVAL_DEDUP_MS = 30_000; // don't re-evaluate the same utterance within this window
 const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000; // pause this long after a 429 from the push provider
 const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
 const MIN_UTTERANCE_WORDS = 3; // don't bother evaluating trivial 1–2 word utterances (unless a "?")
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
-const ANTHROPIC_MAX_TOKENS = 240; // room for warmer, more detailed answers
+const ANTHROPIC_MAX_TOKENS = 160; // enough for a warm 25–40 word reply, fast to generate
 const CONTEXT_CHARS = 1200; // chars of recent transcript sent to Claude
 
 // Per-isolate counter so we log the full raw payload for the first few requests
@@ -254,13 +256,11 @@ type Decision =
   | { fire: false; reason: string };
 
 function decide(state: SessionState, now: number): Decision {
-  // Look only at the other person's most recent turn (the last "Them:" line).
-  const themTurn = lastSpeakerLine(state.recent_transcript, "Them:");
-  if (!themTurn) return { fire: false, reason: "no-other-speaker-utterance" };
-
-  // The most recent COMPLETED sentence (ends in punctuation) — so we wait for
-  // Omi's stream of fragments to finish before acting.
-  const candidate = extractLatestCompletedUtterance(themTurn);
+  // Trigger on the most recent COMPLETED sentence anywhere in the transcript,
+  // regardless of Omi's speaker label — its diarization is unreliable and often
+  // mislabels the other person's questions as "Me:". Claude reads the full
+  // labelled context and decides whether there's anything worth saying.
+  const candidate = extractLatestCompletedUtterance(state.recent_transcript);
   if (!candidate) return { fire: false, reason: "no-completed-utterance-yet" };
 
   // Skip obviously trivial utterances ("Okay.", "Yeah.") to avoid pointless AI
@@ -283,15 +283,6 @@ function decide(state: SessionState, now: number): Decision {
   if (now - state.last_notified_at < COOLDOWN_MS) return { fire: false, reason: "cooldown" };
 
   return { fire: true, candidate, hash };
-}
-
-// The other person's most recent continuous turn (the last line with `prefix`).
-function lastSpeakerLine(transcript: string, prefix: string): string {
-  const lines = transcript.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].startsWith(prefix)) return lines[i].slice(prefix.length).trim();
-  }
-  return "";
 }
 
 // The most recent COMPLETED sentence (ends in . ? !) in `text`, or null if the
@@ -321,12 +312,13 @@ function hashString(s: string): string {
 // Anthropic Messages API — draft Kevin's next words (or "SKIP").
 // -----------------------------------------------------------------------------
 async function callClaude(env: Env, transcript: string): Promise<string | null> {
-  // Send only the tail of the transcript — recent context is enough and less
-  // input means faster prefill (lower time-to-first-token).
-  const context = transcript.slice(-CONTEXT_CHARS);
+  // Send only the tail of the transcript, and STRIP the speaker labels — Omi's
+  // diarization is unreliable, and leaving in wrong "Me:"/"Them:" tags made
+  // Claude ignore the other person's questions. Less input also = faster prefill.
+  const context = transcript.slice(-CONTEXT_CHARS).replace(/^(Me:|Them:) ?/gm, "");
   const userMessage =
-    `Here is the recent conversation Kevin is in ("Them:" is the other person, "Me:" is Kevin; most recent last):\n${context}\n\n` +
-    `Decide if there's something valuable Kevin could say right now. If yes, write it starting with "Say:". If not, reply with exactly SKIP.`;
+    `Here is the recent conversation Kevin is in (most recent last; the speaker of each line is not reliably known):\n${context}\n\n` +
+    `If there's a question or a clear opening for a helpful reply, write what Kevin could say, starting with "Say:". Otherwise reply with exactly SKIP.`;
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
