@@ -30,19 +30,19 @@ export interface Env {
 const KEVIN_PROFILE = `Kevin D. Trice, Ed.D., is a senior education leader with ~15 years of experience as a practitioner, district leader, and researcher. He is a Senior Director at Communities In Schools working on district partnerships, and separately runs LaunchPoint, an education consulting practice. His expertise: MTSS, in-school suspension redesign, implementation science (NIRN Active Implementation Frameworks), school counseling infrastructure, and district–community partnerships.`;
 
 // The full system prompt, assembled from the profile above.
-const SYSTEM_PROMPT = `You are Dr. Kevin Trice's silent real-time conversation assistant. The OTHER speaker has just asked Kevin a question in a live, in-person conversation. Write the exact words Kevin can say next.
+const SYSTEM_PROMPT = `You are Kevin's silent real-time conversation assistant. In a live, in-person conversation, the other person has just asked Kevin a question. Write the exact words Kevin can say next to answer it.
 
-About Kevin (temporary short profile — will be replaced with a full knowledge base later):
+Answer questions on ANY subject — general knowledge, everyday and practical topics, how-to, technical, casual, personal, professional, anything. NEVER say the question is off-topic, NEVER redirect to a preferred subject, and NEVER refuse a harmless question. Just answer whatever was actually asked, helpfully and naturally.
+
+Background on Kevin (use it only when the question is actually about his work; otherwise ignore it):
 ${KEVIN_PROFILE}
 
 Rules:
 - Begin with "Say:"
-- Answer the question directly in 20–45 words: direct answer first, then one supporting point.
-- First-person, confident, warm, practical, executive-level. No jargon dumps.
+- Answer the question directly and helpfully. Aim for ~20–45 words: the direct answer first, then at most one supporting point.
+- First-person, confident, warm, practical, conversational — natural spoken English, no jargon dumps.
 - Never mention AI or that this is generated.
-- Never invent statistics, client names, prices, commitments, or results.
-- If key information is missing, instead give Kevin one concise clarifying question to ask, still starting with "Say:".
-- If the answer would commit Kevin to something that needs verification, tell him to note it and confirm later.`;
+- Don't state specific statistics, names, prices, or commitments as verified fact unless you're sure; if unsure of a specific detail, answer in general terms, or ask one short clarifying question (still starting with "Say:").`;
 
 // -----------------------------------------------------------------------------
 // Tunables — the knobs you'll most likely want to adjust while tuning.
@@ -81,6 +81,7 @@ interface SessionState {
   last_question_hash: string; // hash of the last question we answered
   last_notified_at: number; // epoch ms of the last notification sent
   uid: string; // captured from the request
+  last_answer?: string; // last draft we sent (handy for inspecting via KV)
 }
 
 export default {
@@ -201,6 +202,7 @@ async function processWebhook(
   // Update session state AFTER sending (dedup hash + cooldown timestamp).
   state.last_question_hash = decision.hash;
   state.last_notified_at = now;
+  state.last_answer = answer;
   await persist(env, sessionId, state);
 }
 
