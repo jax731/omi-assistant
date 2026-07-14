@@ -50,6 +50,9 @@ Rules:
 const TRANSCRIPT_CAP = 3000; // max chars of rolling transcript kept per session
 const COOLDOWN_MS = 12_000; // min gap between notifications for one session
 const SAME_QUESTION_WINDOW_MS = 60_000; // don't re-answer the identical question within this window
+const OMI_HOURLY_LIMIT = 10; // Omi caps direct notifications at 10 per hour per user
+const HOUR_MS = 60 * 60 * 1000;
+const OMI_BACKOFF_MS = 5 * 60 * 1000; // pause firing this long after an Omi 429 (rate limit)
 const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
 const MIN_QUESTION_WORDS = 4; // below this (and no "?") we wait for more segments
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
@@ -84,6 +87,10 @@ interface SessionState {
   last_notified_at: number; // epoch ms of the last notification sent
   uid: string; // captured from the request
   last_answer?: string; // last draft we sent (handy for inspecting via KV)
+  last_omi_status?: number; // HTTP status Omi returned for the last delivery
+  last_omi_body?: string; // Omi response body for the last delivery
+  notified_times?: number[]; // epoch ms of recent SUCCESSFUL deliveries (hourly cap)
+  omi_backoff_until?: number; // pause firing until this epoch ms (set after an Omi 429)
 }
 
 export default {
@@ -201,16 +208,27 @@ async function processWebhook(
     return;
   }
 
-  await notifyOmi(env, state.uid, answer);
-
-  // Update session state AFTER sending (dedup hash + cooldown timestamp).
-  state.last_question_hash = decision.hash;
-  state.last_notified_at = now;
+  const delivery = await notifyOmi(env, state.uid, answer);
   state.last_answer = answer;
-  // Clear the slate so the NEXT question is evaluated fresh. Without this the
-  // transcript grows into one giant blob where only the last question ever
-  // fires and earlier ones get buried — the live-testing failure mode.
-  state.recent_transcript = "";
+  state.last_omi_status = delivery.status;
+  state.last_omi_body = delivery.body;
+
+  const delivered = delivery.status >= 200 && delivery.status < 300;
+  if (delivered) {
+    // Success: advance dedup/cooldown, record the send for the hourly cap, and
+    // clear the slate so the NEXT question is evaluated fresh (avoids the
+    // growing-blob bug where only the last question ever fires).
+    state.last_question_hash = decision.hash;
+    state.last_notified_at = now;
+    state.notified_times = [...(state.notified_times ?? []).filter((t) => now - t < HOUR_MS), now];
+    state.omi_backoff_until = 0;
+    state.recent_transcript = "";
+  } else if (delivery.status === 429) {
+    // Omi hourly limit hit — back off so we stop wasting Claude calls, and keep
+    // the transcript so this question can retry once the limit clears.
+    state.omi_backoff_until = now + OMI_BACKOFF_MS;
+    console.log(`OMI_RATE_LIMITED session=${sessionId} backoff_until=${now + OMI_BACKOFF_MS}`);
+  }
   await persist(env, sessionId, state);
 }
 
@@ -238,6 +256,17 @@ function decide(state: SessionState, now: number): Decision {
   // Claude one clean question instead of a garbled running blob.
   const question = extractLatestCompletedQuestion(themTurn);
   if (!question) return { fire: false, reason: "no-completed-question-yet" };
+
+  // Respect Omi's 10/hour notification limit: after a 429 we back off, and we
+  // proactively stop once we've delivered 10 in the trailing hour — both avoid
+  // wasting Claude calls on sends Omi will reject.
+  if (state.omi_backoff_until && now < state.omi_backoff_until) {
+    return { fire: false, reason: "omi-rate-limit-backoff" };
+  }
+  const notifsThisHour = (state.notified_times ?? []).filter((t) => now - t < HOUR_MS).length;
+  if (notifsThisHour >= OMI_HOURLY_LIMIT) {
+    return { fire: false, reason: "omi-hourly-limit-reached" };
+  }
 
   if (now - state.last_notified_at < COOLDOWN_MS) return { fire: false, reason: "cooldown" };
 
@@ -359,10 +388,14 @@ async function callClaude(
 // -----------------------------------------------------------------------------
 // Omi direct-notification API — deliver the draft to the phone.
 // -----------------------------------------------------------------------------
-async function notifyOmi(env: Env, uid: string, message: string): Promise<void> {
+async function notifyOmi(
+  env: Env,
+  uid: string,
+  message: string,
+): Promise<{ status: number; body: string }> {
   if (!uid) {
     console.log("ERROR omi missing uid — cannot deliver notification");
-    return;
+    return { status: 0, body: "missing-uid" };
   }
 
   const endpoint =
@@ -383,8 +416,10 @@ async function notifyOmi(env: Env, uid: string, message: string): Promise<void> 
     } else {
       console.log(`ERROR omi status=${res.status} body=${truncate(respBody, 300)}`);
     }
+    return { status: res.status, body: truncate(respBody, 300) };
   } catch (e) {
     console.log(`ERROR omi exception ${stringifyErr(e)}`);
+    return { status: -1, body: stringifyErr(e) };
   }
 }
 
