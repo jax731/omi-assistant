@@ -8,5 +8,15 @@ compatibility_date = "2025-06-01"
 binding = "OMI_SESSIONS"
 id = "6351adbbb91943409c7bf93774ac5b8b"
 
+# Durable Object: one per session, used purely as a ~2s debounce timer so we
+# evaluate after the speaker PAUSES (reliable even when Omi never punctuates).
+[[durable_objects.bindings]]
+name = "SESSION_DO"
+class_name = "SessionDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionDO"]
+
 # Secrets are NOT stored here. They are set with `wrangler secret put`:
 #   ANTHROPIC_API_KEY, OMI_APP_ID, OMI_APP_SECRET
