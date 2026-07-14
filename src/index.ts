@@ -20,6 +20,7 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   PUSHOVER_APP_TOKEN: string;
   PUSHOVER_USER_KEY: string;
+  DEEPGRAM_API_KEY: string; // for the /audio real-time path (prototype)
 }
 
 // =============================================================================
@@ -70,6 +71,10 @@ const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000; // pause after a 429 from the push 
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const ANTHROPIC_MAX_TOKENS = 220; // room for a translation line + a warm reply
 const CONTEXT_CHARS = 1200; // chars of recent transcript sent to Claude
+
+// /audio (real-time via Deepgram) tunables.
+const DEEPGRAM_UTTERANCE_END_MS = 1000; // Deepgram signals "speaker paused" after this silence
+const AUDIO_IDLE_MS = 20_000; // close the Deepgram connection after this much silence
 
 // Per-isolate counter: log the full raw payload for the first few requests.
 let rawLogCount = 0;
@@ -152,6 +157,23 @@ export default {
       return accepted();
     }
 
+    // Real-time audio path (prototype): Omi POSTs raw PCM16 chunks here.
+    if (request.method === "POST" && url.pathname === "/audio") {
+      const uid = str(url.searchParams.get("uid")) || "unknown";
+      const sampleRate = url.searchParams.get("sample_rate") || "16000";
+      const bytes = await request.arrayBuffer();
+      const stub = env.SESSION_DO.get(env.SESSION_DO.idFromName(uid));
+      ctx.waitUntil(
+        stub
+          .fetch(
+            `https://session.do/audio?uid=${encodeURIComponent(uid)}&sample_rate=${sampleRate}`,
+            { method: "POST", body: bytes },
+          )
+          .catch((e) => console.log(`ERROR forward-audio ${stringifyErr(e)}`)),
+      );
+      return new Response("ok", { status: 200 }); // 200 quickly, as Omi requires
+    }
+
     return new Response("not found", { status: 404 });
   },
 };
@@ -168,6 +190,14 @@ function accepted(): Response {
 // the last one (a pause), fires alarm() to evaluate once.
 // -----------------------------------------------------------------------------
 export class SessionDO {
+  // In-memory audio-bridge state (re-established on demand after eviction).
+  private dgWs?: WebSocket;
+  private dgConnecting = false;
+  private audioQueue: ArrayBuffer[] = [];
+  private pendingTranscript = "";
+  private audioSessionId = "";
+  private audioUid = "";
+
   constructor(
     private state: DurableObjectState,
     private env: Env,
@@ -194,6 +224,18 @@ export class SessionDO {
       return Response.json({ sessionId, state });
     }
 
+    // --- Real-time audio chunk (prototype) ---
+    if (path === "/audio") {
+      const u = new URL(request.url);
+      const uid = u.searchParams.get("uid") || "";
+      const sampleRate = parseInt(u.searchParams.get("sample_rate") || "16000", 10) || 16000;
+      const bytes = await request.arrayBuffer();
+      await this.state.storage.put("sessionId", uid);
+      await this.handleAudio(uid, sampleRate, bytes);
+      return new Response("ok");
+    }
+
+    // --- Transcript path (Omi's default: it POSTs already-transcribed segments) ---
     try {
       const { uid, sessionId, segments } = (await request.json()) as {
         uid: string;
@@ -207,7 +249,8 @@ export class SessionDO {
       mergeSegments(s, segments);
       await this.save(s);
 
-      // (Re)set the debounce alarm — each new segment pushes it back.
+      // (Re)set the 2s debounce alarm — each new segment pushes it back.
+      await this.state.storage.put("alarmMode", "debounce");
       await this.state.storage.setAlarm(Date.now() + DEBOUNCE_MS);
       console.log(`INGEST session=${sessionId} segs=${segments.length}`);
     } catch (e) {
@@ -216,16 +259,141 @@ export class SessionDO {
     return new Response("ok");
   }
 
-  // Fires once the speaker has paused for ~DEBOUNCE_MS.
   async alarm(): Promise<void> {
+    const mode = (await this.state.storage.get<string>("alarmMode")) ?? "debounce";
     const sessionId = (await this.state.storage.get<string>("sessionId")) ?? "";
     try {
+      if (mode === "idle") {
+        // Audio path went quiet — flush anything pending and close Deepgram.
+        await this.finalizeUtterance();
+        if (this.dgWs) {
+          try {
+            this.dgWs.close();
+          } catch {
+            /* ignore */
+          }
+          this.dgWs = undefined;
+        }
+        console.log(`AUDIO_IDLE_CLOSE session=${sessionId}`);
+        return;
+      }
+      // Transcript path: the speaker paused ~DEBOUNCE_MS ago → evaluate.
       const s = await this.load("");
       await evaluateAndDeliver(this.env, sessionId, s);
       await this.save(s);
     } catch (e) {
       console.log(`ERROR alarm ${stringifyErr(e)}`);
     }
+  }
+
+  // ---- Audio bridge -----------------------------------------------------------
+  private async handleAudio(uid: string, sampleRate: number, bytes: ArrayBuffer): Promise<void> {
+    this.audioSessionId = uid;
+    this.audioUid = uid;
+    await this.ensureDeepgram(sampleRate);
+    if (this.dgWs) {
+      try {
+        this.dgWs.send(bytes);
+      } catch (e) {
+        console.log(`ERROR dg-send ${stringifyErr(e)}`);
+        this.dgWs = undefined;
+        this.audioQueue.push(bytes);
+      }
+    } else {
+      this.audioQueue.push(bytes);
+      if (this.audioQueue.length > 300) this.audioQueue.shift(); // cap the buffer
+    }
+    // Idle-close timer, pushed back on every chunk.
+    await this.state.storage.put("alarmMode", "idle");
+    await this.state.storage.setAlarm(Date.now() + AUDIO_IDLE_MS);
+  }
+
+  private async ensureDeepgram(sampleRate: number): Promise<void> {
+    if (this.dgWs || this.dgConnecting) return;
+    this.dgConnecting = true;
+    try {
+      const params = new URLSearchParams({
+        encoding: "linear16",
+        sample_rate: String(sampleRate),
+        channels: "1",
+        model: "nova-3",
+        language: "multi", // English + Spanish (code-switching)
+        smart_format: "true",
+        interim_results: "true",
+        utterance_end_ms: String(DEEPGRAM_UTTERANCE_END_MS),
+        vad_events: "true",
+      });
+      const resp = await fetch(`https://api.deepgram.com/v1/listen?${params.toString()}`, {
+        headers: { Upgrade: "websocket", Authorization: `Token ${this.env.DEEPGRAM_API_KEY}` },
+      });
+      const ws = resp.webSocket;
+      if (!ws) {
+        console.log(`ERROR deepgram upgrade failed status=${resp.status}`);
+        this.dgConnecting = false;
+        return;
+      }
+      ws.accept();
+      this.dgWs = ws;
+      this.dgConnecting = false;
+      console.log(`DG_OPEN session=${this.audioSessionId}`);
+      for (const chunk of this.audioQueue) {
+        try {
+          ws.send(chunk);
+        } catch {
+          /* ignore */
+        }
+      }
+      this.audioQueue = [];
+      ws.addEventListener("message", (event: MessageEvent) => {
+        const data = typeof event.data === "string" ? event.data : "";
+        this.onDeepgramMessage(data).catch((e) => console.log(`ERROR dg-msg ${stringifyErr(e)}`));
+      });
+      ws.addEventListener("close", () => {
+        console.log("DG_CLOSE");
+        this.dgWs = undefined;
+      });
+      ws.addEventListener("error", () => {
+        console.log("DG_ERROR");
+        this.dgWs = undefined;
+      });
+    } catch (e) {
+      console.log(`ERROR deepgram connect ${stringifyErr(e)}`);
+      this.dgConnecting = false;
+    }
+  }
+
+  private async onDeepgramMessage(data: string): Promise<void> {
+    if (!data) return;
+    let msg: { type?: string; is_final?: boolean; channel?: { alternatives?: Array<{ transcript?: string }> } };
+    try {
+      msg = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (msg.type === "Results") {
+      const text = (msg.channel?.alternatives?.[0]?.transcript || "").trim();
+      if (text && msg.is_final) {
+        this.pendingTranscript += (this.pendingTranscript ? " " : "") + text;
+      }
+    } else if (msg.type === "UtteranceEnd") {
+      await this.finalizeUtterance();
+    }
+  }
+
+  // A full utterance finished (Deepgram detected a pause) → append + evaluate.
+  private async finalizeUtterance(): Promise<void> {
+    const utter = this.pendingTranscript.trim();
+    this.pendingTranscript = "";
+    if (!utter) return;
+    console.log(`DG_UTTERANCE session=${this.audioSessionId} text="${truncate(utter, 120)}"`);
+    const s = await this.load(this.audioUid);
+    if (this.audioUid) s.uid = this.audioUid;
+    s.recent_transcript += (s.recent_transcript ? "\n" : "") + `Them: ${utter}`;
+    if (s.recent_transcript.length > TRANSCRIPT_CAP) {
+      s.recent_transcript = s.recent_transcript.slice(-TRANSCRIPT_CAP);
+    }
+    await evaluateAndDeliver(this.env, this.audioSessionId, s);
+    await this.save(s);
   }
 }
 
