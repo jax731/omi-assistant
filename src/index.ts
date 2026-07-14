@@ -39,7 +39,7 @@ ${KEVIN_PROFILE}
 
 Rules:
 - Begin with "Say:"
-- Answer the question directly and helpfully. Aim for ~20–45 words: the direct answer first, then at most one supporting point.
+- Be brief and fast to read aloud. Aim for ~15–30 words: lead with the direct answer; add a supporting point only if it really helps. No preamble.
 - First-person, confident, warm, practical, conversational — natural spoken English, no jargon dumps.
 - Never mention AI or that this is generated.
 - Don't state specific statistics, names, prices, or commitments as verified fact unless you're sure; if unsure of a specific detail, answer in general terms, or ask one short clarifying question (still starting with "Say:").`;
@@ -52,7 +52,8 @@ const COOLDOWN_MS = 20_000; // min gap between notifications for one session
 const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
 const MIN_QUESTION_WORDS = 4; // below this (and no "?") we wait for more segments
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
-const ANTHROPIC_MAX_TOKENS = 200;
+const ANTHROPIC_MAX_TOKENS = 120; // lower cap = faster worst-case generation
+const CONTEXT_CHARS = 1000; // chars of recent transcript sent to Claude (less = faster prefill)
 
 // Words that, at the START of the other person's utterance, mark a question.
 const INTERROGATIVES = new Set([
@@ -187,7 +188,9 @@ async function processWebhook(
 
   // We have a fresh, completed question from the other person → ask Claude.
   console.log(`AI_CALL session=${sessionId} q="${truncate(decision.question, 120)}"`);
+  const t0 = Date.now();
   const answer = await callClaude(env, state.recent_transcript, decision.question);
+  console.log(`AI_DONE session=${sessionId} ms=${Date.now() - t0} ok=${answer !== null}`);
 
   if (!answer) {
     // AI failed — log and skip. Do NOT retry in a loop. Leave hash/time as-is so
@@ -299,8 +302,11 @@ async function callClaude(
   transcript: string,
   question: string,
 ): Promise<string | null> {
+  // Send only the tail of the transcript — recent context is enough and less
+  // input means faster prefill (lower time-to-first-token).
+  const context = transcript.slice(-CONTEXT_CHARS);
   const userMessage =
-    `Recent conversation:\n${transcript}\n\n` +
+    `Recent conversation:\n${context}\n\n` +
     `Latest question from the other person:\n${question}`;
 
   try {
