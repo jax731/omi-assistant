@@ -1,25 +1,26 @@
 /**
  * Omi real-time conversation assistant — Cloudflare Worker.
  *
- * Omi POSTs live transcript segments to /webhook. When the OTHER person asks a
- * question, we send the recent conversation to Claude Haiku, which drafts the
- * exact words Kevin could say next, then deliver that draft back to the phone
- * via Omi's direct-notification API.
+ * Omi POSTs live transcript segments to /webhook. The Worker follows the
+ * conversation and, when it would help, asks Claude Haiku for something Kevin
+ * could say next — PROACTIVELY, not only when directly asked — then delivers
+ * that suggestion to Kevin's phone via Pushover.
  *
  * Design rules:
  *  - Respond to Omi in <1ms: return 200 {"accepted": true} and do all real work
  *    asynchronously via ctx.waitUntil(). Omi never waits on the AI call.
  *  - A failure anywhere in the async pipeline must never surface to Omi.
- *  - Logs read like a story via short tags: RECV / FILTERED / AI_CALL /
- *    NOTIFIED / ERROR. Secrets are never logged.
+ *  - Claude itself decides whether a moment is worth a suggestion (else "SKIP"),
+ *    so we can be proactive without spamming.
+ *  - Logs use short tags: RECV / FILTERED / AI_CALL / AI_DONE / SKIPPED /
+ *    NOTIFIED / RATE_LIMITED / ERROR. Secrets are never logged.
  */
 
 export interface Env {
   OMI_SESSIONS: KVNamespace;
   ANTHROPIC_API_KEY: string;
   // Delivery is via Pushover (no per-hour limit). Omi remains the listener that
-  // POSTs transcripts to /webhook; the OMI_* secrets are no longer used for
-  // delivery but are left in place in case we ever switch back.
+  // POSTs transcripts to /webhook.
   PUSHOVER_APP_TOKEN: string;
   PUSHOVER_USER_KEY: string;
 }
@@ -33,40 +34,38 @@ export interface Env {
 const KEVIN_PROFILE = `Kevin D. Trice, Ed.D., is a senior education leader with ~15 years of experience as a practitioner, district leader, and researcher. He is a Senior Director at Communities In Schools working on district partnerships, and separately runs LaunchPoint, an education consulting practice. His expertise: MTSS, in-school suspension redesign, implementation science (NIRN Active Implementation Frameworks), school counseling infrastructure, and district–community partnerships.`;
 
 // The full system prompt, assembled from the profile above.
-const SYSTEM_PROMPT = `You are Kevin's silent real-time conversation assistant. In a live, in-person conversation, the other person has just asked Kevin a question. Write the exact words Kevin can say next to answer it.
+const SYSTEM_PROMPT = `You are Kevin's silent real-time conversation assistant. You quietly follow Kevin's live, in-person conversations and suggest what he could say next — delivered to his phone. You are PROACTIVE: you don't only wait to be asked a direct question; you offer something to say whenever it would genuinely help Kevin in the moment.
 
-Answer questions on ANY subject — general knowledge, everyday and practical topics, how-to, technical, casual, personal, professional, anything. NEVER say the question is off-topic, NEVER redirect to a preferred subject, and NEVER refuse a harmless question. Just answer whatever was actually asked, helpfully and naturally.
+Offer a suggestion (starting with "Say:") when:
+- The other person asked Kevin a question (any subject) — answer it.
+- The other person shared something Kevin could warmly respond to, build on, ask a good follow-up about, or acknowledge.
+- There's a natural opening for Kevin to add a useful insight, a thoughtful reply, or to move the conversation forward.
 
-Background on Kevin (use it only when the question is actually about his work; otherwise ignore it):
-${KEVIN_PROFILE}
+Reply with EXACTLY "SKIP" (nothing else) when there's nothing worth saying right now — small filler, logistics, half-finished thoughts, unclear audio, or when jumping in would feel forced. Staying quiet is better than saying something hollow.
 
-Rules:
+When you do suggest something:
 - Begin with "Say:"
-- Be brief and fast to read aloud. Aim for ~15–30 words: lead with the direct answer; add a supporting point only if it really helps. No preamble.
-- First-person, confident, warm, practical, conversational — natural spoken English, no jargon dumps.
+- Write about 30–60 words: warm, personable, and genuinely helpful, with real substance or a supporting detail — not a bare one-liner. Give Kevin something he'd actually be glad to say.
+- First person, natural spoken English, confident and friendly.
+- Answer questions on ANY subject; never refuse a harmless one.
 - Never mention AI or that this is generated.
-- Don't state specific statistics, names, prices, or commitments as verified fact unless you're sure; if unsure of a specific detail, answer in general terms, or ask one short clarifying question (still starting with "Say:").`;
+- Don't invent specific statistics, names, prices, or commitments as fact; if unsure, speak in general terms or offer a warm clarifying question.
+
+Background on Kevin (use it when the conversation relates to his work; otherwise ignore it):
+${KEVIN_PROFILE}`;
 
 // -----------------------------------------------------------------------------
 // Tunables — the knobs you'll most likely want to adjust while tuning.
 // -----------------------------------------------------------------------------
 const TRANSCRIPT_CAP = 3000; // max chars of rolling transcript kept per session
-const COOLDOWN_MS = 12_000; // min gap between notifications for one session
-const SAME_QUESTION_WINDOW_MS = 60_000; // don't re-answer the identical question within this window
-const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000; // pause firing this long after a 429 from the push provider
+const COOLDOWN_MS = 15_000; // min gap between suggestions for one session
+const EVAL_DEDUP_MS = 30_000; // don't re-evaluate the same utterance within this window
+const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000; // pause this long after a 429 from the push provider
 const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
-const MIN_QUESTION_WORDS = 4; // below this (and no "?") we wait for more segments
+const MIN_UTTERANCE_WORDS = 3; // don't bother evaluating trivial 1–2 word utterances (unless a "?")
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
-const ANTHROPIC_MAX_TOKENS = 120; // lower cap = faster worst-case generation
-const CONTEXT_CHARS = 1000; // chars of recent transcript sent to Claude (less = faster prefill)
-
-// Words that, at the START of the other person's utterance, mark a question.
-const INTERROGATIVES = new Set([
-  "what", "why", "how", "when", "where", "who",
-  "can", "could", "would", "should", "do", "does", "is", "are",
-]);
-// Phrases that mark a question anywhere in the utterance.
-const QUESTION_PHRASES = ["tell me", "help me understand", "walk me through"];
+const ANTHROPIC_MAX_TOKENS = 240; // room for warmer, more detailed answers
+const CONTEXT_CHARS = 1200; // chars of recent transcript sent to Claude
 
 // Per-isolate counter so we log the full raw payload for the first few requests
 // (to verify the real payload shape against our assumptions), then go quiet.
@@ -84,8 +83,9 @@ interface Segment {
 
 interface SessionState {
   recent_transcript: string; // rolling, speaker-labelled ("Them:" / "Me:")
-  last_question_hash: string; // hash of the last question we answered
-  last_notified_at: number; // epoch ms of the last notification sent
+  last_eval_hash: string; // hash of the last utterance we evaluated (answered or skipped)
+  last_eval_at: number; // epoch ms of the last evaluation
+  last_notified_at: number; // epoch ms of the last suggestion actually sent
   uid: string; // captured from the request
   last_answer?: string; // last draft we sent (handy for inspecting via KV)
   last_delivery_status?: number; // HTTP status from the push provider for the last delivery
@@ -161,13 +161,13 @@ async function processWebhook(
   const stored = await env.OMI_SESSIONS.get(sessionId);
   const state: SessionState = stored
     ? (JSON.parse(stored) as SessionState)
-    : { recent_transcript: "", last_question_hash: "", last_notified_at: 0, uid };
+    : { recent_transcript: "", last_eval_hash: "", last_eval_at: 0, last_notified_at: 0, uid };
   if (uid) state.uid = uid;
 
   // Append every new segment (both sides — context needs both). Omi streams
   // tiny partial fragments (often mid-word), so we MERGE consecutive segments
   // from the same speaker into one line instead of one line per fragment —
-  // this reassembles a coherent utterance we can scan for a real question.
+  // this reassembles a coherent utterance we can scan for a completed sentence.
   for (const seg of segments) {
     const text = str(seg?.text).trim();
     if (!text) continue;
@@ -194,20 +194,31 @@ async function processWebhook(
     return;
   }
 
-  // We have a fresh, completed question from the other person → ask Claude.
-  console.log(`AI_CALL session=${sessionId} q="${truncate(decision.question, 120)}"`);
+  // A new completed thing was said → let Claude decide if it's worth a suggestion.
+  console.log(`AI_CALL session=${sessionId} heard="${truncate(decision.candidate, 120)}"`);
   const t0 = Date.now();
-  const answer = await callClaude(env, state.recent_transcript, decision.question);
+  const answer = await callClaude(env, state.recent_transcript);
   console.log(`AI_DONE session=${sessionId} ms=${Date.now() - t0} ok=${answer !== null}`);
 
+  // Mark this utterance evaluated regardless of outcome, so we don't re-call on it.
+  state.last_eval_hash = decision.hash;
+  state.last_eval_at = now;
+
   if (!answer) {
-    // AI failed — log and skip. Do NOT retry in a loop. Leave hash/time as-is so
-    // the same question can be retried on the next segment for this session.
+    // AI failed — log and move on. Do NOT retry in a loop.
     console.log(`ERROR ai returned no answer session=${sessionId}`);
     await persist(env, sessionId, state);
     return;
   }
 
+  // Claude decides nothing is worth saying right now.
+  if (answer.trim().toUpperCase().startsWith("SKIP")) {
+    console.log(`SKIPPED session=${sessionId} (nothing worth saying)`);
+    await persist(env, sessionId, state);
+    return;
+  }
+
+  // Deliver the suggestion.
   const delivery = await notifyPushover(env, answer);
   state.last_answer = answer;
   state.last_delivery_status = delivery.status;
@@ -215,16 +226,13 @@ async function processWebhook(
 
   const delivered = delivery.status >= 200 && delivery.status < 300;
   if (delivered) {
-    // Success: advance dedup/cooldown and clear the slate so the NEXT question
-    // is evaluated fresh (avoids the growing-blob bug where only the last
-    // question ever fires).
-    state.last_question_hash = decision.hash;
+    // Success: start the cooldown and clear the slate so the NEXT moment is
+    // evaluated fresh (avoids a growing transcript blob).
     state.last_notified_at = now;
     state.backoff_until = 0;
     state.recent_transcript = "";
   } else if (delivery.status === 429) {
-    // Push provider rate-limited us — back off, keep the transcript so this
-    // question retries once the limit clears.
+    // Push provider rate-limited us — back off, keep the transcript so we retry.
     state.backoff_until = now + RATE_LIMIT_BACKOFF_MS;
     console.log(`RATE_LIMITED session=${sessionId} backoff_until=${now + RATE_LIMIT_BACKOFF_MS}`);
   }
@@ -238,10 +246,11 @@ async function persist(env: Env, sessionId: string, state: SessionState): Promis
 }
 
 // -----------------------------------------------------------------------------
-// Decide whether the latest thing the OTHER person said is a question to answer.
+// Decide whether to evaluate this moment with Claude. (Claude then decides
+// whether to actually suggest something or SKIP.)
 // -----------------------------------------------------------------------------
 type Decision =
-  | { fire: true; question: string; hash: string }
+  | { fire: true; candidate: string; hash: string }
   | { fire: false; reason: string };
 
 function decide(state: SessionState, now: number): Decision {
@@ -249,28 +258,31 @@ function decide(state: SessionState, now: number): Decision {
   const themTurn = lastSpeakerLine(state.recent_transcript, "Them:");
   if (!themTurn) return { fire: false, reason: "no-other-speaker-utterance" };
 
-  // Extract the most recent COMPLETED question from that turn. "Completed"
-  // means it ends in sentence punctuation — so we naturally wait for Omi's
-  // stream of fragments to finish the sentence before firing, and we hand
-  // Claude one clean question instead of a garbled running blob.
-  const question = extractLatestCompletedQuestion(themTurn);
-  if (!question) return { fire: false, reason: "no-completed-question-yet" };
+  // The most recent COMPLETED sentence (ends in punctuation) — so we wait for
+  // Omi's stream of fragments to finish before acting.
+  const candidate = extractLatestCompletedUtterance(themTurn);
+  if (!candidate) return { fire: false, reason: "no-completed-utterance-yet" };
 
-  // After a 429 from the push provider, pause briefly instead of hammering it.
+  // Skip obviously trivial utterances ("Okay.", "Yeah.") to avoid pointless AI
+  // calls — unless it's phrased as a question.
+  if (candidate.split(/\s+/).length < MIN_UTTERANCE_WORDS && !candidate.endsWith("?")) {
+    return { fire: false, reason: "utterance-too-trivial" };
+  }
+
   if (state.backoff_until && now < state.backoff_until) {
     return { fire: false, reason: "rate-limit-backoff" };
   }
 
-  if (now - state.last_notified_at < COOLDOWN_MS) return { fire: false, reason: "cooldown" };
-
-  // Guard against re-answering the SAME question in quick succession (trailing
-  // fragments, or Omi re-sending) — but allow a genuine re-ask after a while.
-  const hash = hashString(normalizeQuestion(question));
-  if (hash === state.last_question_hash && now - state.last_notified_at < SAME_QUESTION_WINDOW_MS) {
-    return { fire: false, reason: "same-question-just-answered" };
+  // Don't re-evaluate the exact same utterance we just looked at.
+  const hash = hashString(normalizeText(candidate));
+  if (hash === state.last_eval_hash && now - (state.last_eval_at ?? 0) < EVAL_DEDUP_MS) {
+    return { fire: false, reason: "already-evaluated" };
   }
 
-  return { fire: true, question, hash };
+  // Space out suggestions.
+  if (now - state.last_notified_at < COOLDOWN_MS) return { fire: false, reason: "cooldown" };
+
+  return { fire: true, candidate, hash };
 }
 
 // The other person's most recent continuous turn (the last line with `prefix`).
@@ -282,37 +294,17 @@ function lastSpeakerLine(transcript: string, prefix: string): string {
   return "";
 }
 
-// Find the most recent COMPLETED, question-shaped sentence in `text`.
-// Only sentences that end in `.`/`?`/`!` are considered — an in-progress
-// fragment with no terminator yet is ignored, so we wait for the speaker to
-// finish. Returns null if there's no completed question.
-function extractLatestCompletedQuestion(text: string): string | null {
+// The most recent COMPLETED sentence (ends in . ? !) in `text`, or null if the
+// speaker hasn't finished a sentence yet. Whether it's worth responding to is
+// left to Claude (proactive mode), not a rigid question filter.
+function extractLatestCompletedUtterance(text: string): string | null {
   const sentences = text.match(/[^.?!]+[.?!]+/g);
   if (!sentences) return null;
-  for (let i = sentences.length - 1; i >= 0; i--) {
-    const s = sentences[i].trim();
-    if (isQuestionShaped(s)) return s;
-  }
-  return null;
+  const last = sentences[sentences.length - 1].trim();
+  return last || null;
 }
 
-function isQuestionShaped(sentence: string): boolean {
-  const t = sentence.trim();
-  if (!t) return false;
-  if (t.endsWith("?")) return true; // clearest signal — Omi punctuates questions
-
-  // No "?" — accept only if it clearly opens like a question and is long enough
-  // to trust (guards against stray one-word fragments like "Is." / "Do.").
-  const words = t.split(/\s+/);
-  if (words.length < MIN_QUESTION_WORDS) return false;
-  const first = words[0].toLowerCase().replace(/[^a-z]/g, "");
-  const lower = t.toLowerCase();
-  if (INTERROGATIVES.has(first)) return true;
-  if (QUESTION_PHRASES.some((p) => lower.includes(p))) return true;
-  return false;
-}
-
-function normalizeQuestion(text: string): string {
+function normalizeText(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
@@ -326,19 +318,15 @@ function hashString(s: string): string {
 }
 
 // -----------------------------------------------------------------------------
-// Anthropic Messages API — draft Kevin's next words.
+// Anthropic Messages API — draft Kevin's next words (or "SKIP").
 // -----------------------------------------------------------------------------
-async function callClaude(
-  env: Env,
-  transcript: string,
-  question: string,
-): Promise<string | null> {
+async function callClaude(env: Env, transcript: string): Promise<string | null> {
   // Send only the tail of the transcript — recent context is enough and less
   // input means faster prefill (lower time-to-first-token).
   const context = transcript.slice(-CONTEXT_CHARS);
   const userMessage =
-    `Recent conversation:\n${context}\n\n` +
-    `Latest question from the other person:\n${question}`;
+    `Here is the recent conversation Kevin is in ("Them:" is the other person, "Me:" is Kevin; most recent last):\n${context}\n\n` +
+    `Decide if there's something valuable Kevin could say right now. If yes, write it starting with "Say:". If not, reply with exactly SKIP.`;
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
