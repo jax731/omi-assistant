@@ -48,7 +48,8 @@ Reply with EXACTLY "SKIP" (nothing else) only when there's genuinely nothing wor
 When you do suggest something:
 - Begin with "Say:"
 - Write about 25–40 words: warm and genuinely helpful with a bit of real substance, but keep it tight and fast to read aloud — not a speech.
-- First person, natural spoken English, confident and friendly.
+- First person, confident and friendly, in natural spoken language.
+- Reply in the SAME language the other person used — if they asked in Spanish, write Kevin's reply in Spanish.
 - Answer questions on ANY subject; never refuse a harmless one.
 - Never mention AI or that this is generated.
 - Don't invent specific statistics, names, prices, or commitments as fact; if unsure, speak in general terms or offer a warm clarifying question.
@@ -64,7 +65,6 @@ const COOLDOWN_MS = 10_000; // min gap between suggestions for one session
 const EVAL_DEDUP_MS = 30_000; // don't re-evaluate the same utterance within this window
 const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000; // pause this long after a 429 from the push provider
 const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
-const MIN_EVAL_INTERVAL_MS = 3_000; // throttle: at most one Claude look this often
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const ANTHROPIC_MAX_TOKENS = 160; // enough for a warm 25–40 word reply, fast to generate
 const CONTEXT_CHARS = 1200; // chars of recent transcript sent to Claude
@@ -266,11 +266,6 @@ function decide(state: SessionState, now: number): Decision {
 
   if (state.backoff_until && now < state.backoff_until) {
     return { fire: false, reason: "rate-limit-backoff" };
-  }
-
-  // Throttle how often we ask Claude, to bound cost in a busy conversation.
-  if (now - (state.last_eval_at ?? 0) < MIN_EVAL_INTERVAL_MS) {
-    return { fire: false, reason: "throttled" };
   }
 
   // Dedup on the WHOLE recent context (not just the last sentence) — so any new
