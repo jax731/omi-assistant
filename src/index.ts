@@ -41,7 +41,7 @@ Offer a suggestion (starting with "Say:") when:
 - Someone shared something Kevin could warmly respond to, build on, ask a good follow-up about, or acknowledge.
 - There's a natural opening for Kevin to add a useful insight, a thoughtful reply, or to move the conversation forward.
 
-IMPORTANT: You are NOT told who said each line — automatic speaker detection is unreliable, so it's left out. Judge purely by the words. If there's a question in the air or a clear opening for a helpful reply, suggest what Kevin could say. Lean toward being helpful.
+Each line is labelled by speaker: "Them:" is the other person and "Me:" is Kevin. Focus on what the OTHER person ("Them:") asks or says — that's what Kevin needs help responding to. Speaker labels are usually right but can occasionally be off, so if there's clearly a question in the air, help even if it looks mislabelled. Lean toward being helpful.
 
 Reply with EXACTLY "SKIP" (nothing else) only when there's genuinely nothing worth saying — pure filler ("okay", "yeah"), logistics, half-finished thoughts, or unclear audio. When in doubt and there's a question in the air, answer it rather than skipping.
 
@@ -256,15 +256,11 @@ type Decision =
   | { fire: false; reason: string };
 
 function decide(state: SessionState, now: number): Decision {
-  // Trigger on the most recent COMPLETED sentence anywhere in the transcript,
-  // regardless of Omi's speaker label — its diarization is unreliable and often
-  // mislabels the other person's questions as "Me:". Claude reads the full
-  // labelled context and decides whether there's anything worth saying.
+  // Trigger on the most recent COMPLETED sentence anywhere in the transcript.
   const candidate = extractLatestCompletedUtterance(state.recent_transcript);
   if (!candidate) return { fire: false, reason: "no-completed-utterance-yet" };
 
-  // Skip obviously trivial utterances ("Okay.", "Yeah.") to avoid pointless AI
-  // calls — unless it's phrased as a question.
+  // Skip obviously trivial utterances ("Okay.", "Yeah.") — unless it's a question.
   if (candidate.split(/\s+/).length < MIN_UTTERANCE_WORDS && !candidate.endsWith("?")) {
     return { fire: false, reason: "utterance-too-trivial" };
   }
@@ -312,13 +308,12 @@ function hashString(s: string): string {
 // Anthropic Messages API — draft Kevin's next words (or "SKIP").
 // -----------------------------------------------------------------------------
 async function callClaude(env: Env, transcript: string): Promise<string | null> {
-  // Send only the tail of the transcript, and STRIP the speaker labels — Omi's
-  // diarization is unreliable, and leaving in wrong "Me:"/"Them:" tags made
-  // Claude ignore the other person's questions. Less input also = faster prefill.
-  const context = transcript.slice(-CONTEXT_CHARS).replace(/^(Me:|Them:) ?/gm, "");
+  // Send only the tail of the transcript, keeping the speaker labels ("Them:" is
+  // the other person, "Me:" is Kevin) so Claude knows who is asking.
+  const context = transcript.slice(-CONTEXT_CHARS);
   const userMessage =
-    `Here is the recent conversation Kevin is in (most recent last; the speaker of each line is not reliably known):\n${context}\n\n` +
-    `If there's a question or a clear opening for a helpful reply, write what Kevin could say, starting with "Say:". Otherwise reply with exactly SKIP.`;
+    `Here is the recent conversation Kevin is in ("Them:" is the other person, "Me:" is Kevin; most recent last):\n${context}\n\n` +
+    `If the other person asked a question or there's a clear opening for a helpful reply, write what Kevin could say, starting with "Say:". Otherwise reply with exactly SKIP.`;
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
