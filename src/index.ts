@@ -64,7 +64,7 @@ const COOLDOWN_MS = 10_000; // min gap between suggestions for one session
 const EVAL_DEDUP_MS = 30_000; // don't re-evaluate the same utterance within this window
 const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000; // pause this long after a 429 from the push provider
 const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
-const MIN_UTTERANCE_WORDS = 3; // don't bother evaluating trivial 1–2 word utterances (unless a "?")
+const MIN_EVAL_INTERVAL_MS = 3_000; // throttle: at most one Claude look this often
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const ANTHROPIC_MAX_TOKENS = 160; // enough for a warm 25–40 word reply, fast to generate
 const CONTEXT_CHARS = 1200; // chars of recent transcript sent to Claude
@@ -256,29 +256,35 @@ type Decision =
   | { fire: false; reason: string };
 
 function decide(state: SessionState, now: number): Decision {
-  // Trigger on the most recent COMPLETED sentence anywhere in the transcript.
-  const candidate = extractLatestCompletedUtterance(state.recent_transcript);
-  if (!candidate) return { fire: false, reason: "no-completed-utterance-yet" };
+  const recent = state.recent_transcript.slice(-CONTEXT_CHARS).trim();
+  if (!recent) return { fire: false, reason: "no-content" };
 
-  // Skip obviously trivial utterances ("Okay.", "Yeah.") — unless it's a question.
-  if (candidate.split(/\s+/).length < MIN_UTTERANCE_WORDS && !candidate.endsWith("?")) {
-    return { fire: false, reason: "utterance-too-trivial" };
+  // Need at least one finished sentence somewhere (don't fire on pure fragments).
+  if (!extractLatestCompletedUtterance(state.recent_transcript)) {
+    return { fire: false, reason: "no-completed-utterance-yet" };
   }
 
   if (state.backoff_until && now < state.backoff_until) {
     return { fire: false, reason: "rate-limit-backoff" };
   }
 
-  // Don't re-evaluate the exact same utterance we just looked at.
-  const hash = hashString(normalizeText(candidate));
+  // Throttle how often we ask Claude, to bound cost in a busy conversation.
+  if (now - (state.last_eval_at ?? 0) < MIN_EVAL_INTERVAL_MS) {
+    return { fire: false, reason: "throttled" };
+  }
+
+  // Dedup on the WHOLE recent context (not just the last sentence) — so any new
+  // content re-triggers a look. Claude then finds the latest UNANSWERED question
+  // in the context, which fixes buried questions when several arrive at once.
+  const hash = hashString(normalizeText(recent));
   if (hash === state.last_eval_hash && now - (state.last_eval_at ?? 0) < EVAL_DEDUP_MS) {
     return { fire: false, reason: "already-evaluated" };
   }
 
-  // Space out suggestions.
+  // Space out delivered suggestions.
   if (now - state.last_notified_at < COOLDOWN_MS) return { fire: false, reason: "cooldown" };
 
-  return { fire: true, candidate, hash };
+  return { fire: true, candidate: recent, hash };
 }
 
 // The most recent COMPLETED sentence (ends in . ? !) in `text`, or null if the
@@ -313,7 +319,7 @@ async function callClaude(env: Env, transcript: string): Promise<string | null> 
   const context = transcript.slice(-CONTEXT_CHARS);
   const userMessage =
     `Here is the recent conversation Kevin is in ("Them:" is the other person, "Me:" is Kevin; most recent last):\n${context}\n\n` +
-    `If the other person asked a question or there's a clear opening for a helpful reply, write what Kevin could say, starting with "Say:". Otherwise reply with exactly SKIP.`;
+    `Find the most recent question or clear request from the other person that Kevin hasn't answered yet — it may NOT be the very last line — and write Kevin's reply to it, starting with "Say:". If there's genuinely nothing that needs a response, reply with exactly SKIP.`;
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
