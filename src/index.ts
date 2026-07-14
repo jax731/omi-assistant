@@ -67,7 +67,6 @@ const TRANSCRIPT_CAP = 3000; // max chars of rolling transcript kept per session
 const COOLDOWN_MS = 10_000; // min gap between suggestions for one session
 const EVAL_DEDUP_MS = 30_000; // don't re-evaluate identical context within this window
 const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000; // pause after a 429 from the push provider
-const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const ANTHROPIC_MAX_TOKENS = 220; // room for a translation line + a warm reply
 const CONTEXT_CHARS = 1200; // chars of recent transcript sent to Claude
@@ -106,6 +105,14 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return new Response("ok", { status: 200 });
+    }
+
+    // Debug: inspect a session's state (held in the Durable Object, not KV).
+    if (request.method === "GET" && url.pathname === "/debug") {
+      const session = url.searchParams.get("session") || "";
+      if (!session) return new Response("missing ?session", { status: 400 });
+      const stub = env.SESSION_DO.get(env.SESSION_DO.idFromName(session));
+      return stub.fetch("https://session.do/debug");
     }
 
     if (request.method === "POST" && url.pathname === "/webhook") {
@@ -166,7 +173,27 @@ export class SessionDO {
     private env: Env,
   ) {}
 
+  // State lives in the DO's own storage (NOT KV) — built for frequent per-request
+  // writes, so we don't burn Cloudflare's small daily KV write quota.
+  private async load(uid: string): Promise<SessionState> {
+    const s = await this.state.storage.get<SessionState>("state");
+    return (
+      s ?? { recent_transcript: "", last_eval_hash: "", last_eval_at: 0, last_notified_at: 0, uid }
+    );
+  }
+  private async save(state: SessionState): Promise<void> {
+    await this.state.storage.put("state", state);
+  }
+
   async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+
+    if (path === "/debug") {
+      const state = (await this.state.storage.get<SessionState>("state")) ?? null;
+      const sessionId = (await this.state.storage.get<string>("sessionId")) ?? "";
+      return Response.json({ sessionId, state });
+    }
+
     try {
       const { uid, sessionId, segments } = (await request.json()) as {
         uid: string;
@@ -175,10 +202,10 @@ export class SessionDO {
       };
       await this.state.storage.put("sessionId", sessionId);
 
-      const s = await loadState(this.env, sessionId, uid);
+      const s = await this.load(uid);
       if (uid) s.uid = uid;
       mergeSegments(s, segments);
-      await saveState(this.env, sessionId, s);
+      await this.save(s);
 
       // (Re)set the debounce alarm — each new segment pushes it back.
       await this.state.storage.setAlarm(Date.now() + DEBOUNCE_MS);
@@ -192,29 +219,14 @@ export class SessionDO {
   // Fires once the speaker has paused for ~DEBOUNCE_MS.
   async alarm(): Promise<void> {
     const sessionId = (await this.state.storage.get<string>("sessionId")) ?? "";
-    if (!sessionId) return;
     try {
-      const s = await loadState(this.env, sessionId, "");
+      const s = await this.load("");
       await evaluateAndDeliver(this.env, sessionId, s);
+      await this.save(s);
     } catch (e) {
       console.log(`ERROR alarm ${stringifyErr(e)}`);
     }
   }
-}
-
-// -----------------------------------------------------------------------------
-// State storage (KV — kept here so it's easy to inspect with `wrangler kv`).
-// -----------------------------------------------------------------------------
-async function loadState(env: Env, sessionId: string, uid: string): Promise<SessionState> {
-  const stored = await env.OMI_SESSIONS.get(sessionId);
-  if (stored) return JSON.parse(stored) as SessionState;
-  return { recent_transcript: "", last_eval_hash: "", last_eval_at: 0, last_notified_at: 0, uid };
-}
-
-async function saveState(env: Env, sessionId: string, state: SessionState): Promise<void> {
-  await env.OMI_SESSIONS.put(sessionId, JSON.stringify(state), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  });
 }
 
 // Merge Omi's fragments into speaker-labelled lines (consecutive same-speaker
@@ -271,12 +283,10 @@ async function evaluateAndDeliver(env: Env, sessionId: string, state: SessionSta
 
   if (!answer) {
     console.log(`ERROR ai returned no answer session=${sessionId}`);
-    await saveState(env, sessionId, state);
     return;
   }
   if (answer.trim().toUpperCase().startsWith("SKIP")) {
     console.log(`SKIPPED session=${sessionId}`);
-    await saveState(env, sessionId, state);
     return;
   }
 
@@ -294,7 +304,6 @@ async function evaluateAndDeliver(env: Env, sessionId: string, state: SessionSta
     state.backoff_until = now + RATE_LIMIT_BACKOFF_MS;
     console.log(`RATE_LIMITED session=${sessionId} backoff_until=${now + RATE_LIMIT_BACKOFF_MS}`);
   }
-  await saveState(env, sessionId, state);
 }
 
 function normalizeText(text: string): string {
