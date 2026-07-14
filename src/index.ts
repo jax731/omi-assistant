@@ -48,7 +48,8 @@ Rules:
 // Tunables — the knobs you'll most likely want to adjust while tuning.
 // -----------------------------------------------------------------------------
 const TRANSCRIPT_CAP = 3000; // max chars of rolling transcript kept per session
-const COOLDOWN_MS = 20_000; // min gap between notifications for one session
+const COOLDOWN_MS = 12_000; // min gap between notifications for one session
+const SAME_QUESTION_WINDOW_MS = 60_000; // don't re-answer the identical question within this window
 const SESSION_TTL_SECONDS = 2 * 60 * 60; // KV key self-expires after 2 hours
 const MIN_QUESTION_WORDS = 4; // below this (and no "?") we wait for more segments
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
@@ -206,6 +207,10 @@ async function processWebhook(
   state.last_question_hash = decision.hash;
   state.last_notified_at = now;
   state.last_answer = answer;
+  // Clear the slate so the NEXT question is evaluated fresh. Without this the
+  // transcript grows into one giant blob where only the last question ever
+  // fires and earlier ones get buried — the live-testing failure mode.
+  state.recent_transcript = "";
   await persist(env, sessionId, state);
 }
 
@@ -234,10 +239,14 @@ function decide(state: SessionState, now: number): Decision {
   const question = extractLatestCompletedQuestion(themTurn);
   if (!question) return { fire: false, reason: "no-completed-question-yet" };
 
-  const hash = hashString(normalizeQuestion(question));
-  if (hash === state.last_question_hash) return { fire: false, reason: "duplicate-question" };
-
   if (now - state.last_notified_at < COOLDOWN_MS) return { fire: false, reason: "cooldown" };
+
+  // Guard against re-answering the SAME question in quick succession (trailing
+  // fragments, or Omi re-sending) — but allow a genuine re-ask after a while.
+  const hash = hashString(normalizeQuestion(question));
+  if (hash === state.last_question_hash && now - state.last_notified_at < SAME_QUESTION_WINDOW_MS) {
+    return { fire: false, reason: "same-question-just-answered" };
+  }
 
   return { fire: true, question, hash };
 }
