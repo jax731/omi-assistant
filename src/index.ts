@@ -154,12 +154,21 @@ async function processWebhook(
     : { recent_transcript: "", last_question_hash: "", last_notified_at: 0, uid };
   if (uid) state.uid = uid;
 
-  // Append EVERY new segment (both sides — context needs both) with a label.
+  // Append every new segment (both sides — context needs both). Omi streams
+  // tiny partial fragments (often mid-word), so we MERGE consecutive segments
+  // from the same speaker into one line instead of one line per fragment —
+  // this reassembles a coherent utterance we can scan for a real question.
   for (const seg of segments) {
     const text = str(seg?.text).trim();
     if (!text) continue;
-    const label = seg?.is_user === true ? "Me:" : "Them:";
-    state.recent_transcript += (state.recent_transcript ? "\n" : "") + `${label} ${text}`;
+    const prefix = seg?.is_user === true ? "Me:" : "Them:";
+    const lines = state.recent_transcript ? state.recent_transcript.split("\n") : [];
+    if (lines.length > 0 && lines[lines.length - 1].startsWith(prefix)) {
+      lines[lines.length - 1] += ` ${text}`; // same speaker still talking → merge
+    } else {
+      lines.push(`${prefix} ${text}`); // speaker changed → new line
+    }
+    state.recent_transcript = lines.join("\n");
   }
   // Cap to the most recent ~TRANSCRIPT_CAP chars.
   if (state.recent_transcript.length > TRANSCRIPT_CAP) {
@@ -209,62 +218,62 @@ type Decision =
   | { fire: false; reason: string };
 
 function decide(state: SessionState, now: number): Decision {
-  // The candidate question = the trailing run of consecutive "Them:" lines
-  // (i.e. everything the other person has said since Kevin last spoke). This
-  // naturally accumulates a question split across multiple webhook calls.
-  const candidate = trailingOtherSpeakerText(state.recent_transcript);
-  if (!candidate) return { fire: false, reason: "no-question-from-other-speaker" };
+  // Look only at the other person's most recent turn (the last "Them:" line).
+  const themTurn = lastSpeakerLine(state.recent_transcript, "Them:");
+  if (!themTurn) return { fire: false, reason: "no-other-speaker-utterance" };
 
-  const shape = looksLikeCompletedQuestion(candidate);
-  if (!shape.ok) return { fire: false, reason: shape.reason };
+  // Extract the most recent COMPLETED question from that turn. "Completed"
+  // means it ends in sentence punctuation — so we naturally wait for Omi's
+  // stream of fragments to finish the sentence before firing, and we hand
+  // Claude one clean question instead of a garbled running blob.
+  const question = extractLatestCompletedQuestion(themTurn);
+  if (!question) return { fire: false, reason: "no-completed-question-yet" };
 
-  const hash = hashString(normalizeQuestion(candidate));
+  const hash = hashString(normalizeQuestion(question));
   if (hash === state.last_question_hash) return { fire: false, reason: "duplicate-question" };
 
   if (now - state.last_notified_at < COOLDOWN_MS) return { fire: false, reason: "cooldown" };
 
-  return { fire: true, question: candidate, hash };
+  return { fire: true, question, hash };
 }
 
-// Everything the other person has said since Kevin last spoke, joined to one string.
-function trailingOtherSpeakerText(transcript: string): string {
+// The other person's most recent continuous turn (the last line with `prefix`).
+function lastSpeakerLine(transcript: string, prefix: string): string {
   const lines = transcript.split("\n");
-  const them: string[] = [];
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    if (line.startsWith("Them:")) {
-      them.unshift(line.slice("Them:".length).trim());
-    } else {
-      // Hit a "Me:" line (Kevin spoke) or a truncated/unlabelled line — stop.
-      break;
-    }
+    if (lines[i].startsWith(prefix)) return lines[i].slice(prefix.length).trim();
   }
-  return them.join(" ").trim();
+  return "";
 }
 
-function looksLikeCompletedQuestion(text: string): { ok: true } | { ok: false; reason: string } {
-  const t = text.trim();
-  if (!t) return { ok: false, reason: "empty" };
+// Find the most recent COMPLETED, question-shaped sentence in `text`.
+// Only sentences that end in `.`/`?`/`!` are considered — an in-progress
+// fragment with no terminator yet is ignored, so we wait for the speaker to
+// finish. Returns null if there's no completed question.
+function extractLatestCompletedQuestion(text: string): string | null {
+  const sentences = text.match(/[^.?!]+[.?!]+/g);
+  if (!sentences) return null;
+  for (let i = sentences.length - 1; i >= 0; i--) {
+    const s = sentences[i].trim();
+    if (isQuestionShaped(s)) return s;
+  }
+  return null;
+}
 
+function isQuestionShaped(sentence: string): boolean {
+  const t = sentence.trim();
+  if (!t) return false;
+  if (t.endsWith("?")) return true; // clearest signal — Omi punctuates questions
+
+  // No "?" — accept only if it clearly opens like a question and is long enough
+  // to trust (guards against stray one-word fragments like "Is." / "Do.").
   const words = t.split(/\s+/);
+  if (words.length < MIN_QUESTION_WORDS) return false;
   const first = words[0].toLowerCase().replace(/[^a-z]/g, "");
   const lower = t.toLowerCase();
-
-  const endsWithQuestionMark = t.endsWith("?");
-  const startsWithInterrogative = INTERROGATIVES.has(first);
-  const containsQuestionPhrase = QUESTION_PHRASES.some((p) => lower.includes(p));
-
-  if (!endsWithQuestionMark && !startsWithInterrogative && !containsQuestionPhrase) {
-    return { ok: false, reason: "not-question-shaped" };
-  }
-
-  // "Appears finished" guard: if there's no "?" and it's very short, it's
-  // probably still mid-sentence — wait for more segments rather than firing.
-  if (!endsWithQuestionMark && words.length < MIN_QUESTION_WORDS) {
-    return { ok: false, reason: "too-short-and-unfinished" };
-  }
-
-  return { ok: true };
+  if (INTERROGATIVES.has(first)) return true;
+  if (QUESTION_PHRASES.some((p) => lower.includes(p))) return true;
+  return false;
 }
 
 function normalizeQuestion(text: string): string {
